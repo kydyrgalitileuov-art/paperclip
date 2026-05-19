@@ -1,87 +1,81 @@
-# syntax=docker/dockerfile:1.20
-FROM node:lts-trixie-slim AS base
-ARG USER_UID=1000
-ARG USER_GID=1000
+# Build upstream Paperclip from a pinned ref.
+FROM node:22-bookworm AS paperclip-build
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 \
-  && rm -rf /var/lib/apt/lists/* \
-  && corepack enable
-
-# Modify the existing node user/group to have the specified UID/GID to match host user
-RUN usermod -u $USER_UID --non-unique node \
-  && groupmod -g $USER_GID --non-unique node \
-  && usermod -g $USER_GID -d /paperclip node
-
-FROM base AS deps
-WORKDIR /app
-COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ./
-COPY cli/package.json cli/
-COPY server/package.json server/
-COPY ui/package.json ui/
-COPY packages/shared/package.json packages/shared/
-COPY packages/db/package.json packages/db/
-COPY packages/adapter-utils/package.json packages/adapter-utils/
-COPY packages/mcp-server/package.json packages/mcp-server/
-COPY packages/adapters/acpx-local/package.json packages/adapters/acpx-local/
-COPY packages/adapters/claude-local/package.json packages/adapters/claude-local/
-COPY packages/adapters/codex-local/package.json packages/adapters/codex-local/
-COPY packages/adapters/cursor-cloud/package.json packages/adapters/cursor-cloud/
-COPY packages/adapters/cursor-local/package.json packages/adapters/cursor-local/
-COPY packages/adapters/gemini-local/package.json packages/adapters/gemini-local/
-COPY packages/adapters/grok-local/package.json packages/adapters/grok-local/
-COPY packages/adapters/openclaw-gateway/package.json packages/adapters/openclaw-gateway/
-COPY packages/adapters/opencode-local/package.json packages/adapters/opencode-local/
-COPY packages/adapters/pi-local/package.json packages/adapters/pi-local/
-COPY packages/plugins/sdk/package.json packages/plugins/sdk/
-COPY --parents packages/plugins/sandbox-providers/./*/package.json packages/plugins/sandbox-providers/
-COPY packages/plugins/paperclip-plugin-fake-sandbox/package.json packages/plugins/paperclip-plugin-fake-sandbox/
-COPY packages/plugins/plugin-llm-wiki/package.json packages/plugins/plugin-llm-wiki/
-COPY packages/plugins/plugin-workspace-diff/package.json packages/plugins/plugin-workspace-diff/
-COPY patches/ patches/
-COPY scripts/link-plugin-dev-sdk.mjs scripts/
-
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+RUN corepack enable
+ARG PAPERCLIP_REPO=https://github.com/paperclipai/paperclip.git
+ARG PAPERCLIP_REF=v2026.416.0
+WORKDIR /paperclip
+RUN git clone --depth 1 --branch "${PAPERCLIP_REF}" "${PAPERCLIP_REPO}" .
 RUN pnpm install --frozen-lockfile
-
-FROM base AS build
-WORKDIR /app
-COPY --from=deps /app /app
-COPY . .
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @paperclipai/server build
-RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
+RUN test -f server/dist/index.js
 
-FROM base AS production
-ARG USER_UID=1000
-ARG USER_GID=1000
+# Runtime image (direct Paperclip server, no wrapper).
+FROM node:22-bookworm
+ENV NODE_ENV=production
+ENV CLAUDE_CODE_BUBBLEWRAP=1
+# Match upstream production image defaults (paperclipai/paperclip Dockerfile) so
+# agent tooling, OpenCode, and config paths behave the same in containers.
+ENV HOME=/paperclip \
+    PAPERCLIP_INSTANCE_ID=default \
+    PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
+    OPENCODE_ALLOW_ALL_MODELS=true
+
+# Fix: pin npm global prefix BEFORE corepack so globals land in /usr/local
+# and ensure that location is always first in PATH.
+ENV npm_config_prefix=/usr/local
+ENV PATH="/usr/local/bin:${PATH}"
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    jq \
+    openssh-client \
+    ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+RUN corepack enable
+
 WORKDIR /app
-COPY --chown=node:node --from=build /app /app
-RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends openssh-client jq \
-  && rm -rf /var/lib/apt/lists/* \
-  && mkdir -p /paperclip \
-  && chown node:node /paperclip
+COPY --from=paperclip-build /paperclip /app
 
-COPY scripts/docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+WORKDIR /wrapper
+COPY package.json /wrapper/package.json
+RUN npm install --omit=dev && npm cache clean --force
+COPY src /wrapper/src
+COPY scripts/entrypoint.sh /wrapper/entrypoint.sh
+COPY scripts/bootstrap-ceo.mjs /wrapper/template/bootstrap-ceo.mjs
+RUN chmod +x /wrapper/entrypoint.sh
 
-ENV NODE_ENV=production \
-  HOME=/paperclip \
-  HOST=0.0.0.0 \
-  PORT=3100 \
-  SERVE_UI=true \
-  PAPERCLIP_HOME=/paperclip \
-  PAPERCLIP_INSTANCE_ID=default \
-  USER_UID=${USER_UID} \
-  USER_GID=${USER_GID} \
-  PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
-  PAPERCLIP_DEPLOYMENT_MODE=authenticated \
-  PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
-  OPENCODE_ALLOW_ALL_MODELS=true
+# Install global adapters/tools with explicit prefix so binaries are in /usr/local/bin.
+RUN npm install --global --omit=dev \
+        @anthropic-ai/claude-code@latest \
+        @openai/codex@latest \
+        opencode-ai \
+        @google/gemini-cli@latest \
+        tsx \
+    && npm cache clean --force
 
-VOLUME ["/paperclip"]
+# Verify every binary is resolvable before the image is sealed.
+RUN which claude   && claude   --version || true
+RUN which codex    && codex    --version || true
+RUN which opencode && opencode --version || true
+RUN which gemini   && gemini   --version || true
+RUN which tsx      && tsx      --version || true
+
+RUN mkdir -p /paperclip /paperclip/.gemini \
+    && chown -R node:node /app /paperclip /wrapper
+
+# Railway sets PORT at runtime and this process binds to it.
+# Entrypoint runs as root, fixes /paperclip volume permissions, then execs as node.
 EXPOSE 3100
-
-ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
+ENTRYPOINT ["/wrapper/entrypoint.sh"]
+CMD ["node", "/wrapper/src/server.js"]
